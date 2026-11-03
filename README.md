@@ -1,6 +1,6 @@
-# Document API
+# Document and AI Backend
 
-A persistent backend with full CRUD APIs, token-based authentication, and pagination.
+A persistent backend with full CRUD APIs, token-based authentication, pagination, and AI-powered document Q&A. Extends Assignment 2 with RAG (retrieval-augmented generation) using FAISS and Anthropic.
 
 Built with Django 6.1 and Django REST Framework 3.18.
 
@@ -13,6 +13,8 @@ Built with Django 6.1 and Django REST Framework 3.18.
 | `Document` | id, title, content, uploaded_at, owner |
 | `QueryLog` | id, query_text, result_summary, created_at, user |
 | `UserSession` | id, user, token, created_at, expires_at |
+| `AIQueryLog` | id, user, endpoint, query_text, response_text, sources, created_at |
+| `DocumentChunk` | id, document, owner, chunk_index, text, faiss_row |
 
 ---
 
@@ -22,10 +24,12 @@ Built with Django 6.1 and Django REST Framework 3.18.
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env            # set SECRET_KEY in .env
+cp .env.example .env            # set SECRET_KEY and ANTHROPIC_API_KEY
 python manage.py migrate
 python manage.py runserver
 ```
+
+The app refuses to start without both `SECRET_KEY` and `ANTHROPIC_API_KEY` set. The first RAG call downloads the `all-MiniLM-L6-v2` embedding model (~90 MB) and caches it locally. The fake key in `.env.example` is enough to run the tests.
 
 ---
 
@@ -118,12 +122,66 @@ List the authenticated user's query history, newest first.
 
 ---
 
+### AI
+
+#### `POST /api/ask-ai`
+Send a prompt to the LLM and get a response.
+
+- **Body:** `prompt` (max 2 000 characters)
+- **200** — `{ "response": "..." }`
+- **400** — blank or oversized prompt
+- **401** — missing or invalid token
+- **502** — Anthropic request failed
+
+#### `POST /api/ingest-doc`
+Chunk a document, embed it, and build the user's FAISS index. Idempotent: ingesting the same document twice leaves the same result.
+
+- **Body:** `document_id` (positive integer)
+- **200** — `{ "status": "ingested", "document_id": 12, "chunk_count": 3 }` — `chunk_count` is the number of chunks for this document only.
+- **400** — missing or invalid `document_id`
+- **401** — missing or invalid token
+- **404** — document does not exist, or belongs to another user (same response for both)
+
+#### `POST /api/rag-query`
+Retrieve the most relevant chunks from the user's index and answer using the LLM. If the user has no ingested documents, returns a fixed "no relevant documents" message with `sources: []` without calling the LLM.
+
+- **Body:** `query` (max 2 000 characters)
+- **200** — `{ "answer": "...", "sources": [{ "document_id": 12, "chunk_text": "..." }] }`
+- **400** — blank or oversized query
+- **401** — missing or invalid token
+- **502** — Anthropic request failed
+
+#### `GET /api/query-history`
+List the authenticated user's AI query history (both `ask-ai` and `rag-query` calls), newest first.
+
+- **Query params:** `page`, `page_size` (default 10, max 100)
+- **200** — `{ count, next, previous, results }` — each result has `id`, `endpoint`, `query_text`, `response_text`, `sources`, `created_at`
+- **401** — missing or invalid token
+
+---
+
 ### Health
 
 #### `GET /health`
 Liveness check. No authentication required.
 
 - **200** — `{ "status": "healthy" }`
+
+---
+
+## How the AI part works
+
+**Chunking** — Documents are split into 500-character chunks with 100 characters of overlap, by character count. Overlap ensures that a sentence cut at a boundary still appears whole in one chunk.
+
+**Embeddings** — `all-MiniLM-L6-v2` (384 dimensions, normalized to unit length, `float32`). The model runs locally and is downloaded on the first RAG call (~90 MB).
+
+**Vector store** — One FAISS `IndexFlatIP` (flat inner-product, equivalent to cosine similarity on normalized vectors) per user, stored at `faiss_indexes/user_<id>.index`. The `DocumentChunk` table is the source of truth: every ingest rebuilds the user's entire index from their current chunks, renumbering `faiss_row` from 0. Because the index path and the chunk lookup both use `user.id`, a search can only ever see its owner's vectors.
+
+**Retrieval** — Top 3 chunks by inner product score.
+
+**LLM** — Anthropic, model from `ANTHROPIC_MODEL` env var, capped at 500 output tokens.
+
+**Prompt templates** — `ask-ai` uses a scoped system prompt (software, data and AI topics) and wraps the user's text in `<user_prompt>` tags. RAG uses a system prompt that instructs the model to answer only from the provided `<context>`, and formats chunks and the question in XML-like tags. Closing tags (`</chunk>`, `</context>`, `</question>`) are escaped in both chunk text and the query before being inserted into the prompt. This reduces the risk of prompt injection from uploaded documents but does not eliminate it — an adversarial document can still include opening tags or other content that influences model behavior.
 
 ---
 
@@ -144,18 +202,26 @@ Default page size is **10**. Override with `?page_size=N` (max 100) and `?page=N
 
 ---
 
+## Known limitations
+
+- **Stale index after document delete.** Deleting a document cascades to its chunks in the database, but the user's FAISS index file is not updated. Searches may return stale results until the next `POST /api/ingest-doc` call on any of the user's documents, which triggers a full index rebuild from the remaining chunks.
+
+- **Partial prompt-injection neutralization.** Closing tags are escaped in chunk text and queries, but opening tags (e.g. `<chunk id="9">`) are not. The system prompt instructs the model to treat context content as data, which reduces the risk but does not eliminate it.
+
+---
+
 ## Tests
 
 ```bash
-python manage.py test api.tests
+python manage.py test
 ```
 
-Run a single module:
+Run a single app or module:
 
 ```bash
+python manage.py test api.tests
+python manage.py test ai.tests
 python manage.py test api.tests.test_auth
-python manage.py test api.tests.test_documents
-python manage.py test api.tests.test_queries
 ```
 
-25 tests total across three files.
+42 tests total. The LLM and the embedding model are mocked, so the tests need no network access and no real API key.

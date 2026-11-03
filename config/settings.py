@@ -27,6 +27,12 @@ SECRET_KEY = os.getenv('SECRET_KEY')
 if not SECRET_KEY:
     raise RuntimeError("SECRET_KEY environment variable is not set")
 
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+if not ANTHROPIC_API_KEY:
+    raise RuntimeError("ANTHROPIC_API_KEY environment variable is not set")
+ANTHROPIC_MODEL = os.getenv('ANTHROPIC_MODEL') or "claude-haiku-5-5"
+
+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 
@@ -44,6 +50,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     "rest_framework",
     "api",
+    "ai",
 ]
 
 MIDDLEWARE = [
@@ -122,6 +129,8 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
+
+INDEX_DIR = BASE_DIR / "faiss_indexes"
 
 
 REST_FRAMEWORK = {
