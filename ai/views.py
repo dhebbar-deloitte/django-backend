@@ -15,12 +15,6 @@ from api.pagination import StandardPagination
 
 logger = logging.getLogger(__name__)
 
-
-@api_view(['GET'])
-def ping(request):
-    return Response({"message": "Hello, world!"})
-
-
 @api_view(['POST'])
 def ask_ai(request):
     serializer = AskAISerializer(data=request.data)
