@@ -1,15 +1,14 @@
 import logging
 
-from django.db import transaction
 from django.http import Http404
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
 from ai.llm import LLMError, generate
-from ai.models import AIQueryLog, DocumentChunk
+from ai.models import AIQueryLog
 from ai.prompts import RAG_SYSTEM_PROMPT, SYSTEM_PROMPT, build_rag_message, build_user_message
-from ai.rag import build_user_index, chunk_text, search_user_index
+from ai.rag import search_user_index, ingest_document
 from ai.serializers import AIQueryLogSerializer, AskAISerializer, IngestDocSerializer, RagQuerySerializer
 from api.pagination import StandardPagination
 
@@ -42,22 +41,9 @@ def ingest_doc(request):
         document = get_object_or_404(request.user.documents, pk=document_id)
     except Http404:
         return Response({"error": "Not found"}, status=404)
-    texts = chunk_text(document.content)
-    with transaction.atomic():
-        document.chunks.all().delete()
-        DocumentChunk.objects.bulk_create([
-            DocumentChunk(
-                document=document,
-                owner=request.user,
-                chunk_index=i,
-                text=text,
-                faiss_row=0,
-            )
-            for i, text in enumerate(texts)
-        ])
-        build_user_index(request.user)
-    logger.info("Ingested document %d: %d chunks", document_id, len(texts))
-    return Response({"status": "ingested", "document_id": document_id, "chunk_count": len(texts)})
+    chunk_count = ingest_document(request.user, document)
+    logger.info("Ingested document %d: %d chunks", document_id, chunk_count)
+    return Response({"status": "ingested", "document_id": document_id, "chunk_count": chunk_count})
 
 
 NO_CONTEXT_ANSWER = "I don't have any relevant documents to answer your question."

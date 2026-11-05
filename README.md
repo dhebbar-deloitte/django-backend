@@ -6,6 +6,142 @@ Built with Django 6.1 and Django REST Framework 3.18.
 
 ---
 
+## Architecture
+
+```
+Streamlit UI  ──HTTP──►  Django / DRF  ──►  LangGraph agent
+                                                   │
+                                       ┌───────────┼───────────┐
+                                       ▼           ▼           ▼
+                                      LLM        FAISS    Open-Meteo
+                                  (Anthropic)   (local)   (weather)
+```
+
+The Streamlit UI talks only to the Django backend. The backend runs the LangGraph agent, which calls the LLM, queries the FAISS vector store, or hits the weather API depending on the question.
+
+---
+
+## Agent graph
+
+The graph has five nodes and three routes:
+
+```
+START
+  │
+  ▼
+rewrite_question          Rewrites follow-up questions into standalone ones.
+  │
+  ▼
+decide_route              Classifies the question: documents | weather | general
+  │
+  ├──► retrieve_docs ──►  write_answer   (documents route)
+  │
+  ├──► call_weather  ──►  write_answer   (weather route)
+  │
+  └──────────────────────► write_answer  (general route)
+                                │
+                               END
+```
+
+| Node | What it does |
+|---|---|
+| `rewrite_question` | Rewrites follow-ups into standalone questions using the conversation transcript. Skipped on the first message. |
+| `decide_route` | Sends the rewritten question and the user's document titles to the LLM; returns `documents`, `weather`, or `general`. |
+| `retrieve_docs` | Runs a FAISS similarity search over the user's indexed chunks. |
+| `call_weather` | Extracts the city name and calls the Open-Meteo tool. |
+| `write_answer` | Builds the final prompt from the route's context and calls the LLM to produce the answer. |
+
+---
+
+## Memory
+
+Chat sessions and messages are stored in the database (`ChatSession` and `ChatMessage` models). Each turn loads the last **6 messages** from the session and passes them to the agent. Before routing, `rewrite_question` resolves pronouns and references against that history so follow-up questions ("What was its budget?") become searchable standalone queries ("What was Zorblax's budget?"). The rewrite step fires only when history is non-empty.
+
+---
+
+## Routing
+
+The router receives the user's document titles inside `<user_files>` tags and classifies the question as one of three routes:
+
+- **documents** — the answer could be in one of the uploaded files. Topic matching is used, so a question about "pasta" routes to documents when a file named `pasta.pdf` exists. When in doubt between documents and general, the router picks documents.
+- **weather** — the question asks about current weather or temperature.
+- **general** — greetings, general knowledge, and coding questions unrelated to the uploaded files.
+
+Because the router sees the file names (not the file contents), **descriptive file names work better than generic ones** (`pasta_recipe.pdf` vs `scan_001.pdf`).
+
+---
+
+## Weather tool
+
+The weather tool is implemented in [assistant/tools.py](assistant/tools.py) using the free **Open-Meteo** API. When the router picks the `weather` route, `call_weather` extracts the city name with an LLM call and then:
+
+1. Geocodes the city at `geocoding-api.open-meteo.com`.
+2. Fetches the current temperature, humidity, and weather code at `api.open-meteo.com`.
+
+The result is formatted as a string (`London: 12.5°C, Overcast, humidity 70%`) and passed to `write_answer`, which wraps it in `<weather_data>` tags and sends it to the LLM.
+
+---
+
+## Chat endpoints
+
+#### `POST /api/upload-doc`
+Upload and immediately ingest a PDF or TXT file.
+
+- **Body:** multipart form with a `file` field — `.pdf` or `.txt`, max 5 MB.
+- **201** — `{ "status": "ingested", "document_id": 12, "title": "...", "chunk_count": 3 }` — PDFs also include `"page_count"`.
+- **400** — wrong file type, not valid UTF-8, no extractable text, encrypted PDF.
+- **401** — missing or invalid token.
+- **413** — file or extracted text exceeds the size limit.
+
+#### `POST /api/chat`
+Send a message to the agent.
+
+- **Body:** `{ "message": "...", "session_id": 42 }` — `session_id` is optional; omit to start a new session.
+- **200** — `{ "session_id": 42, "answer": "...", "route": "documents", "steps": ["rewrite", "route:documents", "retrieve", "answer"], "tool_output": null, "sources": [{ "document_id": 12, "title": "...", "chunk_text": "..." }] }`
+- **400** — blank or oversized message (max 2 000 characters).
+- **401** — missing or invalid token.
+- **404** — `session_id` does not exist or belongs to another user.
+- **502** — the agent or LLM failed.
+
+#### `GET /api/chat/sessions/{id}`
+Retrieve the full message history for a session.
+
+- **200** — `{ "session_id": 42, "title": "...", "messages": [{ "role": "user"|"assistant", "content": "..." }] }`
+- **401** — missing or invalid token.
+- **404** — session does not exist or belongs to another user.
+
+---
+
+## Auth (UI)
+
+The login screen posts credentials to `POST /login` and stores the returned token in **Streamlit's `session_state`**. All subsequent API calls attach the token as `Authorization: Token <token>`. Because `session_state` is in-memory, a **page refresh clears the token and returns the user to the login screen**. A 401 response from any authenticated call also triggers an automatic logout and redirect.
+
+---
+
+## Setup
+
+```bash
+# Terminal 1 — Django backend
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env            # set SECRET_KEY and ANTHROPIC_API_KEY
+python manage.py migrate
+python manage.py runserver
+
+# Terminal 2 — Streamlit UI
+source venv/bin/activate
+streamlit run ui/app.py
+```
+
+If the Django backend is not on port 8000, set `API_URL` before starting Streamlit:
+
+```bash
+API_URL=http://localhost:9000 streamlit run ui/app.py
+```
+
+---
+
 ## Models
 
 | Model | Fields |
@@ -18,16 +154,7 @@ Built with Django 6.1 and Django REST Framework 3.18.
 
 ---
 
-## Setup
-
-```bash
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env            # set SECRET_KEY and ANTHROPIC_API_KEY
-python manage.py migrate
-python manage.py runserver
-```
+## Notes
 
 The app refuses to start without both `SECRET_KEY` and `ANTHROPIC_API_KEY` set. The first RAG call downloads the `all-MiniLM-L6-v2` embedding model (~90 MB) and caches it locally. The fake key in `.env.example` is enough to run the tests.
 
@@ -221,7 +348,8 @@ Run a single app or module:
 ```bash
 python manage.py test api.tests
 python manage.py test ai.tests
+python manage.py test assistant.tests
 python manage.py test api.tests.test_auth
 ```
 
-42 tests total. The LLM and the embedding model are mocked, so the tests need no network access and no real API key.
+The LLM, the weather HTTP calls, and the embedding model are all faked in the test suite — no network access or real API key needed. `FakeLLM` in `assistant/tests/test_assistant.py` steers each graph node by its system prompt; `fake_httpx_get` returns canned Open-Meteo geocoding and forecast responses; `fake_embed` replaces the sentence-transformer model with a deterministic vector.

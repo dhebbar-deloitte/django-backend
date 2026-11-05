@@ -3,6 +3,7 @@ import functools
 import faiss
 import numpy as np
 from django.conf import settings
+from django.db import transaction
 
 from ai.constants import CHUNK_OVERLAP, CHUNK_SIZE, EMBEDDING_DIM, EMBEDDING_MODEL, TOP_K
 from ai.models import DocumentChunk
@@ -75,3 +76,20 @@ def search_user_index(user, query, k=TOP_K):
         for c in DocumentChunk.objects.filter(owner=user, faiss_row__in=rows)
     }
     return [chunks_by_row[r] for r in rows if r in chunks_by_row]
+
+def ingest_document(user, document):
+    texts = chunk_text(document.content)
+    with transaction.atomic():
+        document.chunks.all().delete()
+        DocumentChunk.objects.bulk_create([
+            DocumentChunk(
+                document=document,
+                owner=user,
+                chunk_index=i,
+                text=text,
+                faiss_row=0,
+            )
+            for i, text in enumerate(texts)
+        ])
+        build_user_index(user)
+    return len(texts)
